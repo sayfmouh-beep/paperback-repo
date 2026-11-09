@@ -1,0 +1,19 @@
+{
+  "name": "mint-paperback",
+  "version": "1.0.0",
+  "description": "Sayf's personal Paperback 0.8 extensions, built and maintained by Mint.",
+  "scripts": {
+    "bundle": "paperback bundle",
+    "serve": "paperback serve",
+    "typecheck": "tsc --noEmit"
+  },
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@paperback/toolchain": "^0.8.7",
+    "@paperback/types": "^0.8.7",
+    "typescript": "^5.9.3"
+  },
+  "repositoryName": "Mint's Paperback Repo",
+  "private": true
+}
