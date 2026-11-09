@@ -820,7 +820,7 @@ var _Sources = (() => {
   var PAGE_SIZE = 32;
   var FEED_SIZE = 500;
   var MintDexInfo = {
-    version: "1.0.0",
+    version: "1.1.0",
     name: "MintDex",
     icon: "icon.png",
     author: "Mint",
@@ -842,7 +842,6 @@ var _Sources = (() => {
       // ---------- home ----------
       this.sections = [
         { id: "popular", title: "Popular", type: import_types.HomeSectionType.featured, order: { "order[followedCount]": "desc" } },
-        { id: "latest", title: "Latest Updates", type: import_types.HomeSectionType.singleRowNormal, order: { "order[latestUploadedChapter]": "desc" } },
         { id: "rated", title: "Top Rated", type: import_types.HomeSectionType.singleRowNormal, order: { "order[rating]": "desc" } },
         { id: "new", title: "Recently Added", type: import_types.HomeSectionType.singleRowNormal, order: { "order[createdAt]": "desc" } }
       ];
@@ -1054,7 +1053,78 @@ var _Sources = (() => {
         metadata: next < total && next < 1e4 ? { offset: next } : void 0
       });
     }
+    // ---------- latest chapters (in your languages) ----------
+    async latestUpdates(offset) {
+      const languages = await getLanguages(this.stateManager);
+      const ratings = await getContentRatings(this.stateManager);
+      const params = {
+        "translatedLanguage": languages,
+        "contentRating": ratings,
+        "includes": ["manga"],
+        "order[readableAt]": "desc",
+        "includeFutureUpdates": "0",
+        limit: 100,
+        offset
+      };
+      const json = await this.getJSON(`${API}/chapter?${this.qs(params)}`);
+      const order = [];
+      const latestCh = {};
+      for (const ch of json.data ?? []) {
+        if (ch.attributes?.externalUrl) continue;
+        const m = (ch.relationships ?? []).find((r) => r.type === "manga");
+        if (!m || latestCh[m.id] !== void 0) continue;
+        order.push(m.id);
+        latestCh[m.id] = ch.attributes?.chapter ? `Ch. ${ch.attributes.chapter}` : "New chapter";
+      }
+      if (order.length === 0) return { tiles: [] };
+      const mangaJson = await this.getJSON(`${API}/manga?${this.qs({ "ids": order, "includes": ["cover_art"], "contentRating": ratings, limit: 100 })}`);
+      const byId = {};
+      for (const m of mangaJson.data ?? []) byId[m.id] = m;
+      const tiles = order.filter((id) => byId[id]).map((id) => this.toTile(byId[id], latestCh[id]));
+      const next = offset + 100;
+      return { tiles, next: next < (json.total ?? 0) && next < 1e4 ? next : void 0 };
+    }
+    // ---------- library update checks ----------
+    async filterUpdatedManga(mangaUpdatesFoundCallback, time, ids) {
+      const wanted = new Set(ids);
+      const found = /* @__PURE__ */ new Set();
+      const languages = await getLanguages(this.stateManager);
+      const ratings = await getContentRatings(this.stateManager);
+      const since = new Date(time.getTime()).toISOString().split(".")[0];
+      let offset = 0;
+      let total = 1;
+      while (offset < total) {
+        if (offset >= 9900) {
+          mangaUpdatesFoundCallback(App.createMangaUpdates({ ids }));
+          return;
+        }
+        const params = {
+          "publishAtSince": since,
+          "translatedLanguage": languages,
+          "contentRating": ratings,
+          "includeFutureUpdates": "0",
+          "order[publishAt]": "desc",
+          limit: 100,
+          offset
+        };
+        const json = await this.getJSON(`${API}/chapter?${this.qs(params)}`);
+        for (const ch of json.data ?? []) {
+          const m = (ch.relationships ?? []).find((r) => r.type === "manga");
+          if (m && wanted.has(m.id)) found.add(m.id);
+        }
+        total = json.total ?? 0;
+        offset += 100;
+        if ((json.data ?? []).length === 0) break;
+      }
+      if (found.size > 0) mangaUpdatesFoundCallback(App.createMangaUpdates({ ids: [...found] }));
+    }
     async getHomePageSections(sectionCallback) {
+      const latest = App.createHomeSection({ id: "latest", title: "Latest Updates", type: import_types.HomeSectionType.singleRowNormal, containsMoreItems: true });
+      sectionCallback(latest);
+      const latestPromise = this.latestUpdates(0).then((r) => {
+        latest.items = r.tiles;
+        sectionCallback(latest);
+      });
       const promises = this.sections.map(async (s) => {
         const section = App.createHomeSection({ id: s.id, title: s.title, type: s.type, containsMoreItems: true });
         sectionCallback(section);
@@ -1062,10 +1132,14 @@ var _Sources = (() => {
         section.items = tiles;
         sectionCallback(section);
       });
-      await Promise.all(promises);
+      await Promise.all([latestPromise, ...promises]);
     }
     async getViewMoreItems(homepageSectionId, metadata) {
       const offset = metadata?.offset ?? 0;
+      if (homepageSectionId === "latest") {
+        const r = await this.latestUpdates(offset);
+        return App.createPagedResults({ results: r.tiles, metadata: r.next !== void 0 ? { offset: r.next } : void 0 });
+      }
       const s = this.sections.find((x) => x.id === homepageSectionId);
       if (!s) return App.createPagedResults({ results: [] });
       const { tiles, total } = await this.mangaList(s.order, offset);
