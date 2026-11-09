@@ -17,7 +17,8 @@ import {
     SourceInfo,
     SourceIntents,
     SourceManga,
-    TagSection
+    TagSection,
+    MangaUpdates
 } from '@paperback/types'
 
 import {
@@ -34,7 +35,7 @@ const PAGE_SIZE = 32
 const FEED_SIZE = 500
 
 export const MintDexInfo: SourceInfo = {
-    version: '1.0.0',
+    version: '1.1.0',
     name: 'MintDex',
     icon: 'icon.png',
     author: 'Mint',
@@ -300,16 +301,89 @@ export class MintDex implements SearchResultsProviding, MangaProviding, ChapterP
         })
     }
 
+
+    // ---------- latest chapters (in your languages) ----------
+
+    private async latestUpdates(offset: number): Promise<{ tiles: PartialSourceManga[], next?: number }> {
+        const languages = await getLanguages(this.stateManager)
+        const ratings = await getContentRatings(this.stateManager)
+        const params = {
+            'translatedLanguage': languages,
+            'contentRating': ratings,
+            'includes': ['manga'],
+            'order[readableAt]': 'desc',
+            'includeFutureUpdates': '0',
+            limit: 100,
+            offset
+        }
+        const json = await this.getJSON(`${API}/chapter?${this.qs(params)}`)
+        const order: string[] = []
+        const latestCh: Record<string, string> = {}
+        for (const ch of json.data ?? []) {
+            if (ch.attributes?.externalUrl) continue
+            const m = (ch.relationships ?? []).find((r: any) => r.type === 'manga')
+            if (!m || latestCh[m.id] !== undefined) continue
+            order.push(m.id)
+            latestCh[m.id] = ch.attributes?.chapter ? `Ch. ${ch.attributes.chapter}` : 'New chapter'
+        }
+        if (order.length === 0) return { tiles: [] }
+        const mangaJson = await this.getJSON(`${API}/manga?${this.qs({ 'ids': order, 'includes': ['cover_art'], 'contentRating': ratings, limit: 100 })}`)
+        const byId: Record<string, any> = {}
+        for (const m of mangaJson.data ?? []) byId[m.id] = m
+        const tiles = order.filter(id => byId[id]).map(id => this.toTile(byId[id], latestCh[id]))
+        const next = offset + 100
+        return { tiles, next: next < (json.total ?? 0) && next < 10000 ? next : undefined }
+    }
+
+    // ---------- library update checks ----------
+
+    async filterUpdatedManga(mangaUpdatesFoundCallback: (updates: MangaUpdates) => void, time: Date, ids: string[]): Promise<void> {
+        const wanted = new Set(ids)
+        const found = new Set<string>()
+        const languages = await getLanguages(this.stateManager)
+        const ratings = await getContentRatings(this.stateManager)
+        const since = new Date(time.getTime()).toISOString().split('.')[0]
+        let offset = 0
+        let total = 1
+        while (offset < total) {
+            if (offset >= 9900) {
+                // Too many chapters since the last check to page through: refresh every title instead.
+                mangaUpdatesFoundCallback(App.createMangaUpdates({ ids }))
+                return
+            }
+            const params = {
+                'publishAtSince': since,
+                'translatedLanguage': languages,
+                'contentRating': ratings,
+                'includeFutureUpdates': '0',
+                'order[publishAt]': 'desc',
+                limit: 100,
+                offset
+            }
+            const json = await this.getJSON(`${API}/chapter?${this.qs(params)}`)
+            for (const ch of json.data ?? []) {
+                const m = (ch.relationships ?? []).find((r: any) => r.type === 'manga')
+                if (m && wanted.has(m.id)) found.add(m.id)
+            }
+            total = json.total ?? 0
+            offset += 100
+            if ((json.data ?? []).length === 0) break
+        }
+        if (found.size > 0) mangaUpdatesFoundCallback(App.createMangaUpdates({ ids: [...found] }))
+    }
+
     // ---------- home ----------
 
     private readonly sections: { id: string, title: string, type: HomeSectionType, order: Record<string, string> }[] = [
         { id: 'popular', title: 'Popular', type: HomeSectionType.featured, order: { 'order[followedCount]': 'desc' } },
-        { id: 'latest', title: 'Latest Updates', type: HomeSectionType.singleRowNormal, order: { 'order[latestUploadedChapter]': 'desc' } },
         { id: 'rated', title: 'Top Rated', type: HomeSectionType.singleRowNormal, order: { 'order[rating]': 'desc' } },
         { id: 'new', title: 'Recently Added', type: HomeSectionType.singleRowNormal, order: { 'order[createdAt]': 'desc' } }
     ]
 
     async getHomePageSections(sectionCallback: (section: HomeSection) => void): Promise<void> {
+        const latest = App.createHomeSection({ id: 'latest', title: 'Latest Updates', type: HomeSectionType.singleRowNormal, containsMoreItems: true })
+        sectionCallback(latest)
+        const latestPromise = this.latestUpdates(0).then(r => { latest.items = r.tiles; sectionCallback(latest) })
         const promises = this.sections.map(async s => {
             const section = App.createHomeSection({ id: s.id, title: s.title, type: s.type, containsMoreItems: true })
             sectionCallback(section)
@@ -317,11 +391,15 @@ export class MintDex implements SearchResultsProviding, MangaProviding, ChapterP
             section.items = tiles
             sectionCallback(section)
         })
-        await Promise.all(promises)
+        await Promise.all([latestPromise, ...promises])
     }
 
     async getViewMoreItems(homepageSectionId: string, metadata: any): Promise<PagedResults> {
         const offset: number = metadata?.offset ?? 0
+        if (homepageSectionId === 'latest') {
+            const r = await this.latestUpdates(offset)
+            return App.createPagedResults({ results: r.tiles, metadata: r.next !== undefined ? { offset: r.next } : undefined })
+        }
         const s = this.sections.find(x => x.id === homepageSectionId)
         if (!s) return App.createPagedResults({ results: [] })
         const { tiles, total } = await this.mangaList(s.order, offset)
